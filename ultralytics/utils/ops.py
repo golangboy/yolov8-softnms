@@ -14,6 +14,65 @@ import torchvision
 from ultralytics.utils import LOGGER
 from ultralytics.utils.metrics import batch_probiou
 
+# -----------------------------------这是Soft_NMS计算方法   start  ---------------------------------------------------------------------
+
+
+def my_soft_nms(bboxes, scores, iou_thresh=0.5, sigma=0.5, score_threshold=0.25):
+    bboxes = bboxes.contiguous()
+
+    x1 = bboxes[:, 0]
+    y1 = bboxes[:, 1]
+    x2 = bboxes[:, 2]
+    y2 = bboxes[:, 3]
+    # 计算每个box的面积
+    areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+    # 首先对所有得分进行一次降序排列,仅此一次,以提高后续查找最大值速度. oeder为降序排列后的索引
+    _, order = scores.sort(0, descending=True)
+    # NMS后,保存留下来的边框
+    keep = []
+
+    while order.numel() > 0:
+        if order.numel() == 1:  # 仅剩最后一个box的索引
+            i = order.item()
+            keep.append(i)
+            break
+        else:
+            i = order[0].item()  # 保留首个得分最大的边框box索引,i为scores中实际坐标
+            keep.append(i)
+        # 巧妙使用tersor.clamp()函数求取order中当前框[0]之外每一个边框,与当前框[0]的最大值和最小值
+        xx1 = x1[order[1:]].clamp(min=x1[i])
+        yy1 = y1[order[1:]].clamp(min=y1[i])
+        xx2 = x2[order[1:]].clamp(max=x2[i])
+        yy2 = y2[order[1:]].clamp(max=y2[i])
+        # 求取order中其他每一个边框与当前边框的交集面积
+        inter = (xx2 - xx1).clamp(min=0) * (yy2 - yy1).clamp(min=0)
+        # 计算order中其他每一个框与当前框的IoU
+        iou = inter / (areas[i] + areas[order[1:]] -
+                       inter)  # 共order.numel()-1个
+
+        idx = (iou > iou_thresh).nonzero().squeeze()  # 获取order中IoU大于阈值的其他边框的索引
+        if idx.numel() > 0:
+            iou = iou[idx]
+            newScores = torch.exp(-torch.pow(iou, 2) / sigma)  # 计算边框的得分衰减
+            scores[order[idx + 1]] *= newScores  # 更新那些IoU大于阈值的边框的得分
+
+        newOrder = (scores[order[1:]] > score_threshold).nonzero().squeeze()
+        if newOrder.numel() == 0:
+            break
+        else:
+            newScores = scores[order[newOrder + 1]]
+            maxScoreIndex = torch.argmax(newScores)
+
+            if maxScoreIndex != 0:
+                newOrder[[0, maxScoreIndex],] = newOrder[[maxScoreIndex, 0],]
+            # 更新order.
+            order = order[newOrder + 1]
+
+    # 返回保留下来的所有边框的索引值,类型torch.LongTensor
+    return torch.LongTensor(keep)
+
+
+# -----------------------------------这是Soft_NMS计算方法  ---------------------------------------------------------------------
 
 class Profile(contextlib.ContextDecorator):
     """
@@ -105,7 +164,8 @@ def scale_boxes(img1_shape, boxes, img0_shape, ratio_pad=None, padding=True, xyw
         boxes (torch.Tensor): The scaled bounding boxes, in the format of (x1, y1, x2, y2)
     """
     if ratio_pad is None:  # calculate from img0_shape
-        gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])  # gain  = old / new
+        gain = min(img1_shape[0] / img0_shape[0],
+                   img1_shape[1] / img0_shape[1])  # gain  = old / new
         pad = (
             round((img1_shape[1] - img0_shape[1] * gain) / 2 - 0.1),
             round((img1_shape[0] - img0_shape[0] * gain) / 2 - 0.1),
@@ -210,7 +270,8 @@ def non_max_suppression(
     # Checks
     assert 0 <= conf_thres <= 1, f"Invalid Confidence threshold {conf_thres}, valid values are between 0.0 and 1.0"
     assert 0 <= iou_thres <= 1, f"Invalid IoU {iou_thres}, valid values are between 0.0 and 1.0"
-    if isinstance(prediction, (list, tuple)):  # YOLOv8 model in validation model, output = (inference_out, loss_out)
+    # YOLOv8 model in validation model, output = (inference_out, loss_out)
+    if isinstance(prediction, (list, tuple)):
         prediction = prediction[0]  # select only inference output
 
     bs = prediction.shape[0]  # batch size
@@ -224,12 +285,15 @@ def non_max_suppression(
     time_limit = 2.0 + max_time_img * bs  # seconds to quit after
     multi_label &= nc > 1  # multiple labels per box (adds 0.5ms/img)
 
-    prediction = prediction.transpose(-1, -2)  # shape(1,84,6300) to shape(1,6300,84)
+    # shape(1,84,6300) to shape(1,6300,84)
+    prediction = prediction.transpose(-1, -2)
     if not rotated:
         if in_place:
-            prediction[..., :4] = xywh2xyxy(prediction[..., :4])  # xywh to xyxy
+            prediction[..., :4] = xywh2xyxy(
+                prediction[..., :4])  # xywh to xyxy
         else:
-            prediction = torch.cat((xywh2xyxy(prediction[..., :4]), prediction[..., 4:]), dim=-1)  # xywh to xyxy
+            prediction = torch.cat(
+                (xywh2xyxy(prediction[..., :4]), prediction[..., 4:]), dim=-1)  # xywh to xyxy
 
     t = time.time()
     output = [torch.zeros((0, 6 + nm), device=prediction.device)] * bs
@@ -255,10 +319,12 @@ def non_max_suppression(
 
         if multi_label:
             i, j = torch.where(cls > conf_thres)
-            x = torch.cat((box[i], x[i, 4 + j, None], j[:, None].float(), mask[i]), 1)
+            x = torch.cat((box[i], x[i, 4 + j, None],
+                          j[:, None].float(), mask[i]), 1)
         else:  # best class only
             conf, j = cls.max(1, keepdim=True)
-            x = torch.cat((box, conf, j.float(), mask), 1)[conf.view(-1) > conf_thres]
+            x = torch.cat((box, conf, j.float(), mask), 1)[
+                conf.view(-1) > conf_thres]
 
         # Filter by class
         if classes is not None:
@@ -269,17 +335,19 @@ def non_max_suppression(
         if not n:  # no boxes
             continue
         if n > max_nms:  # excess boxes
-            x = x[x[:, 4].argsort(descending=True)[:max_nms]]  # sort by confidence and remove excess boxes
+            # sort by confidence and remove excess boxes
+            x = x[x[:, 4].argsort(descending=True)[:max_nms]]
 
         # Batched NMS
         c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes
         scores = x[:, 4]  # scores
         if rotated:
-            boxes = torch.cat((x[:, :2] + c, x[:, 2:4], x[:, -1:]), dim=-1)  # xywhr
+            boxes = torch.cat(
+                (x[:, :2] + c, x[:, 2:4], x[:, -1:]), dim=-1)  # xywhr
             i = nms_rotated(boxes, scores, iou_thres)
         else:
             boxes = x[:, :4] + c  # boxes (offset by class)
-            i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
+            i = my_soft_nms(boxes, scores, iou_thres)  # NMS
         i = i[:max_det]  # limit detections
 
         # # Experimental
@@ -296,7 +364,8 @@ def non_max_suppression(
 
         output[xi] = x[i]
         if (time.time() - t) > time_limit:
-            LOGGER.warning(f"WARNING ⚠️ NMS time limit {time_limit:.3f}s exceeded")
+            LOGGER.warning(
+                f"WARNING ⚠️ NMS time limit {time_limit:.3f}s exceeded")
             break  # time limit exceeded
 
     return output
@@ -361,8 +430,10 @@ def scale_image(masks, im0_shape, ratio_pad=None):
     if im1_shape[:2] == im0_shape[:2]:
         return masks
     if ratio_pad is None:  # calculate from im0_shape
-        gain = min(im1_shape[0] / im0_shape[0], im1_shape[1] / im0_shape[1])  # gain  = old / new
-        pad = (im1_shape[1] - im0_shape[1] * gain) / 2, (im1_shape[0] - im0_shape[0] * gain) / 2  # wh padding
+        gain = min(im1_shape[0] / im0_shape[0],
+                   im1_shape[1] / im0_shape[1])  # gain  = old / new
+        pad = (im1_shape[1] - im0_shape[1] * gain) / \
+            2, (im1_shape[0] - im0_shape[0] * gain) / 2  # wh padding
     else:
         # gain = ratio_pad[0][0]
         pad = ratio_pad[1]
@@ -370,7 +441,8 @@ def scale_image(masks, im0_shape, ratio_pad=None):
     bottom, right = int(im1_shape[0] - pad[1]), int(im1_shape[1] - pad[0])
 
     if len(masks.shape) < 2:
-        raise ValueError(f'"len of masks shape" should be 2 or 3, but got {len(masks.shape)}')
+        raise ValueError(
+            f'"len of masks shape" should be 2 or 3, but got {len(masks.shape)}')
     masks = masks[top:bottom, left:right]
     masks = cv2.resize(masks, (im0_shape[1], im0_shape[0]))
     if len(masks.shape) == 2:
@@ -391,7 +463,8 @@ def xyxy2xywh(x):
         y (np.ndarray | torch.Tensor): The bounding box coordinates in (x, y, width, height) format.
     """
     assert x.shape[-1] == 4, f"input shape last dimension expected 4 but input shape is {x.shape}"
-    y = torch.empty_like(x) if isinstance(x, torch.Tensor) else np.empty_like(x)  # faster than clone/copy
+    y = torch.empty_like(x) if isinstance(
+        x, torch.Tensor) else np.empty_like(x)  # faster than clone/copy
     y[..., 0] = (x[..., 0] + x[..., 2]) / 2  # x center
     y[..., 1] = (x[..., 1] + x[..., 3]) / 2  # y center
     y[..., 2] = x[..., 2] - x[..., 0]  # width
@@ -411,7 +484,8 @@ def xywh2xyxy(x):
         y (np.ndarray | torch.Tensor): The bounding box coordinates in (x1, y1, x2, y2) format.
     """
     assert x.shape[-1] == 4, f"input shape last dimension expected 4 but input shape is {x.shape}"
-    y = torch.empty_like(x) if isinstance(x, torch.Tensor) else np.empty_like(x)  # faster than clone/copy
+    y = torch.empty_like(x) if isinstance(
+        x, torch.Tensor) else np.empty_like(x)  # faster than clone/copy
     dw = x[..., 2] / 2  # half-width
     dh = x[..., 3] / 2  # half-height
     y[..., 0] = x[..., 0] - dw  # top left x
@@ -436,7 +510,8 @@ def xywhn2xyxy(x, w=640, h=640, padw=0, padh=0):
             x1,y1 is the top-left corner, x2,y2 is the bottom-right corner of the bounding box.
     """
     assert x.shape[-1] == 4, f"input shape last dimension expected 4 but input shape is {x.shape}"
-    y = torch.empty_like(x) if isinstance(x, torch.Tensor) else np.empty_like(x)  # faster than clone/copy
+    y = torch.empty_like(x) if isinstance(
+        x, torch.Tensor) else np.empty_like(x)  # faster than clone/copy
     y[..., 0] = w * (x[..., 0] - x[..., 2] / 2) + padw  # top left x
     y[..., 1] = h * (x[..., 1] - x[..., 3] / 2) + padh  # top left y
     y[..., 2] = w * (x[..., 0] + x[..., 2] / 2) + padw  # bottom right x
@@ -462,7 +537,8 @@ def xyxy2xywhn(x, w=640, h=640, clip=False, eps=0.0):
     if clip:
         x = clip_boxes(x, (h - eps, w - eps))
     assert x.shape[-1] == 4, f"input shape last dimension expected 4 but input shape is {x.shape}"
-    y = torch.empty_like(x) if isinstance(x, torch.Tensor) else np.empty_like(x)  # faster than clone/copy
+    y = torch.empty_like(x) if isinstance(
+        x, torch.Tensor) else np.empty_like(x)  # faster than clone/copy
     y[..., 0] = ((x[..., 0] + x[..., 2]) / 2) / w  # x center
     y[..., 1] = ((x[..., 1] + x[..., 3]) / 2) / h  # y center
     y[..., 2] = (x[..., 2] - x[..., 0]) / w  # width
@@ -560,12 +636,14 @@ def xywhr2xyxyxyxy(rboxes):
     cos, sin = (np.cos, np.sin) if is_numpy else (torch.cos, torch.sin)
 
     ctr = rboxes[..., :2]
-    w, h, angle = (rboxes[..., i : i + 1] for i in range(2, 5))
+    w, h, angle = (rboxes[..., i: i + 1] for i in range(2, 5))
     cos_value, sin_value = cos(angle), sin(angle)
     vec1 = [w / 2 * cos_value, w / 2 * sin_value]
     vec2 = [-h / 2 * sin_value, h / 2 * cos_value]
-    vec1 = np.concatenate(vec1, axis=-1) if is_numpy else torch.cat(vec1, dim=-1)
-    vec2 = np.concatenate(vec2, axis=-1) if is_numpy else torch.cat(vec2, dim=-1)
+    vec1 = np.concatenate(
+        vec1, axis=-1) if is_numpy else torch.cat(vec1, dim=-1)
+    vec2 = np.concatenate(
+        vec2, axis=-1) if is_numpy else torch.cat(vec2, dim=-1)
     pt1 = ctr + vec1 + vec2
     pt2 = ctr + vec1 - vec2
     pt3 = ctr - vec1 - vec2
@@ -622,7 +700,8 @@ def resample_segments(segments, n=1000):
         x = np.linspace(0, len(s) - 1, n)
         xp = np.arange(len(s))
         segments[i] = (
-            np.concatenate([np.interp(x, xp, s[:, i]) for i in range(2)], dtype=np.float32).reshape(2, -1).T
+            np.concatenate([np.interp(x, xp, s[:, i])
+                           for i in range(2)], dtype=np.float32).reshape(2, -1).T
         )  # segment xy
     return segments
 
@@ -640,8 +719,10 @@ def crop_mask(masks, boxes):
     """
     _, h, w = masks.shape
     x1, y1, x2, y2 = torch.chunk(boxes[:, :, None], 4, 1)  # x1 shape(n,1,1)
-    r = torch.arange(w, device=masks.device, dtype=x1.dtype)[None, None, :]  # rows shape(1,1,w)
-    c = torch.arange(h, device=masks.device, dtype=x1.dtype)[None, :, None]  # cols shape(1,h,1)
+    r = torch.arange(w, device=masks.device, dtype=x1.dtype)[
+        None, None, :]  # rows shape(1,1,w)
+    c = torch.arange(h, device=masks.device, dtype=x1.dtype)[
+        None, :, None]  # cols shape(1,h,1)
 
     return masks * ((r >= x1) * (r < x2) * (c >= y1) * (c < y2))
 
@@ -662,7 +743,8 @@ def process_mask_upsample(protos, masks_in, bboxes, shape):
     """
     c, mh, mw = protos.shape  # CHW
     masks = (masks_in @ protos.float().view(c, -1)).sigmoid().view(-1, mh, mw)
-    masks = F.interpolate(masks[None], shape, mode="bilinear", align_corners=False)[0]  # CHW
+    masks = F.interpolate(masks[None], shape,
+                          mode="bilinear", align_corners=False)[0]  # CHW
     masks = crop_mask(masks, bboxes)  # CHW
     return masks.gt_(0.5)
 
@@ -685,7 +767,8 @@ def process_mask(protos, masks_in, bboxes, shape, upsample=False):
 
     c, mh, mw = protos.shape  # CHW
     ih, iw = shape
-    masks = (masks_in @ protos.float().view(c, -1)).sigmoid().view(-1, mh, mw)  # CHW
+    masks = (masks_in @ protos.float().view(c, -1)
+             ).sigmoid().view(-1, mh, mw)  # CHW
     width_ratio = mw / iw
     height_ratio = mh / ih
 
@@ -697,7 +780,8 @@ def process_mask(protos, masks_in, bboxes, shape, upsample=False):
 
     masks = crop_mask(masks, downsampled_bboxes)  # CHW
     if upsample:
-        masks = F.interpolate(masks[None], shape, mode="bilinear", align_corners=False)[0]  # CHW
+        masks = F.interpolate(
+            masks[None], shape, mode="bilinear", align_corners=False)[0]  # CHW
     return masks.gt_(0.5)
 
 
@@ -741,7 +825,8 @@ def scale_masks(masks, shape, padding=True):
     bottom, right = (int(mh - pad[1]), int(mw - pad[0]))
     masks = masks[..., top:bottom, left:right]
 
-    masks = F.interpolate(masks, shape, mode="bilinear", align_corners=False)  # NCHW
+    masks = F.interpolate(masks, shape, mode="bilinear",
+                          align_corners=False)  # NCHW
     return masks
 
 
@@ -762,8 +847,10 @@ def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None, normalize=False
         coords (torch.Tensor): The scaled coordinates.
     """
     if ratio_pad is None:  # calculate from img0_shape
-        gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])  # gain  = old / new
-        pad = (img1_shape[1] - img0_shape[1] * gain) / 2, (img1_shape[0] - img0_shape[0] * gain) / 2  # wh padding
+        gain = min(img1_shape[0] / img0_shape[0],
+                   img1_shape[1] / img0_shape[1])  # gain  = old / new
+        pad = (img1_shape[1] - img0_shape[1] * gain) / \
+            2, (img1_shape[0] - img0_shape[0] * gain) / 2  # wh padding
     else:
         gain = ratio_pad[0][0]
         pad = ratio_pad[1]
@@ -816,7 +903,8 @@ def masks2segments(masks, strategy="largest"):
             if strategy == "concat":  # concatenate all segments
                 c = np.concatenate([x.reshape(-1, 2) for x in c])
             elif strategy == "largest":  # select largest segment
-                c = np.array(c[np.array([len(x) for x in c]).argmax()]).reshape(-1, 2)
+                c = np.array(
+                    c[np.array([len(x) for x in c]).argmax()]).reshape(-1, 2)
         else:
             c = np.zeros((0, 2))  # no segments found
         segments.append(c.astype("float32"))
